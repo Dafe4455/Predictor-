@@ -287,6 +287,7 @@ export async function ingestMatches(leagueKey: string): Promise<number> {
     await db.insert(matches).values([matchValues as any]).onConflictDoUpdate({
       target: matches.apiId,
       set: {
+        matchDate, 
         status: mappedStatus,
         homeGoals: match.score?.home ?? null,
         awayGoals: match.score?.away ?? null,
