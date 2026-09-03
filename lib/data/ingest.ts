@@ -1,5 +1,6 @@
 /**
- * Football data ingestion pipeline — BigBallsData version (debug + date fix)
+ * Football data ingestion pipeline — BigBallsData version (auto-detect date)
+ * Scans ALL fields on the match object to find anything that parses as a valid date.
  */
 
 import { db } from "@/lib/db";
@@ -68,42 +69,19 @@ async function apiFetch(endpoint: string, params?: Record<string, string>): Prom
   return data;
 }
 
-// ─── Safe date parser — tries EVERY possible field ───────────────
+// ─── Auto-detect date from ANY field on the object ──────────────
 function parseMatchDate(match: any): Date {
-  // Try every conceivable date field name
-  const candidates = [
-    match.start_time,
-    match.date,
-    match.kickoff,
-    match.scheduled,
-    match.timestamp,
-    match.created_at,
-    match.datetime,
-    match.time,
-    match.startTime,
-    match.startDate,
-    match.kickoff_time,
-    match.match_date,
-    match.fixture_date,
-    match.event_date,
-    match.utcDate,
-    match.utc_date,
-    match.begin_at,
-    match.beginAt,
-    match.scheduled_at,
-    match.scheduledAt,
-    // Nested possibilities
-    match.fixture?.date,
-    match.fixture?.timestamp,
-    match.fixture?.utcDate,
-    match.event?.date,
-    match.match?.date,
-    match.game?.date,
-    match.details?.date,
-    match.info?.date,
+  // First: try all direct properties that look like dates
+  const directCandidates = [
+    "start_time", "date", "kickoff", "scheduled", "timestamp",
+    "created_at", "datetime", "time", "startTime", "startDate",
+    "kickoff_time", "match_date", "fixture_date", "event_date",
+    "utcDate", "utc_date", "begin_at", "beginAt", "scheduled_at",
+    "scheduledAt", "commence_time", "commenceTime", "eventTime",
   ];
 
-  for (const raw of candidates) {
+  for (const key of directCandidates) {
+    const raw = match[key];
     if (raw) {
       const parsed = new Date(raw);
       if (!isNaN(parsed.getTime())) {
@@ -112,9 +90,56 @@ function parseMatchDate(match: any): Date {
     }
   }
 
-  // Log ALL keys to help debug
-  console.warn(`[Date] Could not parse date for match ${match.id}. ALL keys:`, Object.keys(match));
-  console.warn(`[Date] Full match (first 2000 chars):`, JSON.stringify(match).slice(0, 2000));
+  // Second: try nested properties (e.g., match.fixture.date)
+  const nestedPaths = [
+    "fixture.date", "fixture.timestamp", "fixture.utcDate",
+    "event.date", "event.time", "match.date", "game.date",
+    "details.date", "info.date", "meta.date", "data.date",
+  ];
+
+  for (const path of nestedPaths) {
+    const parts = path.split(".");
+    let value: any = match;
+    for (const part of parts) {
+      value = value?.[part];
+      if (value === undefined) break;
+    }
+    if (value) {
+      const parsed = new Date(value);
+      if (!isNaN(parsed.getTime())) {
+        return parsed;
+      }
+    }
+  }
+
+  // Third: brute-force scan ALL string/number fields on the object
+  for (const [key, value] of Object.entries(match)) {
+    if (typeof value === "string" || typeof value === "number") {
+      const parsed = new Date(value as any);
+      if (!isNaN(parsed.getTime()) && parsed.getFullYear() >= 2020 && parsed.getFullYear() <= 2030) {
+        console.log(`[Date] Auto-detected date from field "${key}": ${value}`);
+        return parsed;
+      }
+    }
+  }
+
+  // Fourth: scan nested objects one level deep
+  for (const [topKey, topValue] of Object.entries(match)) {
+    if (topValue && typeof topValue === "object" && !Array.isArray(topValue)) {
+      for (const [subKey, subValue] of Object.entries(topValue as any)) {
+        if (typeof subValue === "string" || typeof subValue === "number") {
+          const parsed = new Date(subValue as any);
+          if (!isNaN(parsed.getTime()) && parsed.getFullYear() >= 2020 && parsed.getFullYear() <= 2030) {
+            console.log(`[Date] Auto-detected date from nested field "${topKey}.${subKey}": ${subValue}`);
+            return parsed;
+          }
+        }
+      }
+    }
+  }
+
+  // Log what we found for debugging
+  console.warn(`[Date] Could not find date for match ${match.id}. All top-level keys:`, Object.keys(match));
   return new Date();
 }
 
@@ -162,12 +187,6 @@ export async function ingestTeams(leagueKey: string): Promise<number> {
   if (!fixtures.length) {
     console.warn(`[Teams] No matches found for league ${leagueKey}`);
     return 0;
-  }
-
-  // DEBUG: Log first match structure
-  if (fixtures[0]) {
-    console.log("[DEBUG-TEAMS] First match keys:", Object.keys(fixtures[0]));
-    console.log("[DEBUG-TEAMS] First match sample:", JSON.stringify(fixtures[0], null, 2).slice(0, 1500));
   }
 
   const teamMap = new Map<string, { apiId: string; name: string; logo?: string }>();
@@ -245,12 +264,6 @@ export async function ingestMatches(leagueKey: string): Promise<number> {
     return 0;
   }
 
-  // DEBUG: Log first match structure
-  if (fixtures[0]) {
-    console.log("[DEBUG-MATCHES] First match keys:", Object.keys(fixtures[0]));
-    console.log("[DEBUG-MATCHES] First match sample:", JSON.stringify(fixtures[0], null, 2).slice(0, 1500));
-  }
-
   let count = 0;
   let skipped = 0;
   let statsFetched = 0;
@@ -323,9 +336,9 @@ export async function ingestMatches(leagueKey: string): Promise<number> {
         homeXg: homeStats.xg != null ? String(homeStats.xg) : null,
         awayXg: awayStats.xg != null ? String(awayStats.xg) : null,
         homeYellows: homeStats.yellow_cards || 0,
-        awayYellows: homeStats.yellow_cards || 0,
+        awayYellows: awayStats.yellow_cards || 0,
         homeReds: homeStats.red_cards || 0,
-        awayReds: awayStats.red_cards || 0,
+        awayReds: homeStats.red_cards || 0,
         homeCorners: homeStats.corners || 0,
         awayCorners: awayStats.corners || 0,
         homePossession: homeStats.possession != null ? String(homeStats.possession) : null,
