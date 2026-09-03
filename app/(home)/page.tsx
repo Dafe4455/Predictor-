@@ -6,6 +6,10 @@ import { MatchCard } from "@/components/matches/MatchCard";
 import { unstable_cache } from "next/cache";
 import { Calendar, Filter } from "lucide-react";
 
+// Force dynamic rendering - don't try to query DB at build time
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
+
 const getTodayMatches = unstable_cache(
   async () => {
     const today = startOfDay(new Date());
@@ -32,7 +36,15 @@ const getTodayMatches = unstable_cache(
 );
 
 export default async function HomePage() {
-  const matchesList = await getTodayMatches();
+  let matchesList: any[] = [];
+  let error: string | null = null;
+
+  try {
+    matchesList = await getTodayMatches();
+  } catch (e) {
+    error = e instanceof Error ? e.message : "Failed to load matches";
+    console.error("Home page error:", e);
+  }
 
   const grouped = matchesList.reduce((acc, match) => {
     const dateKey = format(new Date(match.matchDate), "yyyy-MM-dd");
@@ -47,6 +59,13 @@ export default async function HomePage() {
         <h1 className="text-3xl font-black text-gray-900 mb-2">Match Predictions</h1>
         <p className="text-gray-600">xG-powered predictions for upcoming fixtures</p>
       </div>
+
+      {error && (
+        <div className="rounded-xl bg-red-50 border border-red-200 p-4 mb-6">
+          <p className="text-red-700 text-sm font-medium">Error loading matches: {error}</p>
+          <p className="text-red-500 text-xs mt-1">Make sure the database is set up and the cron job has run at least once.</p>
+        </div>
+      )}
 
       <div className="flex items-center gap-2 mb-6 overflow-x-auto pb-2">
         <Filter className="w-4 h-4 text-gray-400 flex-shrink-0" />
@@ -80,13 +99,13 @@ export default async function HomePage() {
           </section>
         ))}
 
-        {matchesList.length === 0 && (
+        {matchesList.length === 0 && !error && (
           <div className="text-center py-16">
             <div className="w-16 h-16 rounded-full bg-gray-100 mx-auto mb-4 flex items-center justify-center">
               <Calendar className="w-8 h-8 text-gray-400" />
             </div>
             <h3 className="text-lg font-semibold text-gray-700">No upcoming matches</h3>
-            <p className="text-gray-500 mt-1">Check back later for new fixtures</p>
+            <p className="text-gray-500 mt-1">Check back later for new fixtures or run the data ingestion cron job.</p>
           </div>
         )}
       </div>
