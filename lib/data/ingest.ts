@@ -65,7 +65,7 @@ export async function ingestLeagues(): Promise<number> {
     const league = item.league;
     const country = item.country;
 
-    await db.insert(leagues).values({
+    await db.insert(leagues).values([{
       apiId: String(league.id),
       name: league.name,
       country: country.name,
@@ -73,7 +73,7 @@ export async function ingestLeagues(): Promise<number> {
       logo: league.logo,
       flag: country.flag,
       isActive: true,
-    }).onConflictDoUpdate({
+    }]).onConflictDoUpdate({
       target: leagues.apiId,
       set: {
         name: league.name,
@@ -99,7 +99,7 @@ export async function ingestTeams(leagueApiId: string, season: string): Promise<
     const league = await db.select().from(leagues).where(eq(leagues.apiId, leagueApiId)).limit(1);
     const leagueId = league[0]?.id;
 
-    await db.insert(teams).values({
+    await db.insert(teams).values([{
       apiId: String(team.id),
       name: team.name,
       shortName: team.code || team.name.slice(0, 20),
@@ -109,7 +109,7 @@ export async function ingestTeams(leagueApiId: string, season: string): Promise<
       founded: team.founded,
       venueName: venue?.name,
       venueCapacity: venue?.capacity,
-    }).onConflictDoUpdate({
+    }]).onConflictDoUpdate({
       target: teams.apiId,
       set: {
         name: team.name,
@@ -176,49 +176,51 @@ export async function ingestMatches(
       "CANC": "postponed", "ABD": "postponed", "AWD": "postponed", "WO": "postponed",
     };
 
-    await db.insert(matches).values({
+    const matchValues = {
       apiId: String(fixture.id),
-      leagueId: leagueDb?.id,
+      leagueId: leagueDb?.id ?? null,
       season: String(league.season),
       round: parseInt(league.round?.replace(/\D/g, "")) || null,
       homeTeamId: homeDb.id,
       awayTeamId: awayDb.id,
       matchDate: new Date(fixture.date),
       status: statusMap[fixture.status.short] || "scheduled",
-      venue: fixture.venue?.name,
-      referee: fixture.referee,
+      venue: fixture.venue?.name || null,
+      referee: fixture.referee || null,
       homeGoals: goals.home,
       awayGoals: goals.away,
-      homeXg: homeStats["Expected Goals"] || null,
-      awayXg: awayStats["Expected Goals"] || null,
+      homeXg: homeStats["Expected Goals"] ? String(homeStats["Expected Goals"]) : null,
+      awayXg: awayStats["Expected Goals"] ? String(awayStats["Expected Goals"]) : null,
       homeYellows: homeStats["Yellow Cards"] || 0,
       awayYellows: awayStats["Yellow Cards"] || 0,
       homeReds: homeStats["Red Cards"] || 0,
       awayReds: awayStats["Red Cards"] || 0,
       homeCorners: homeStats["Corner Kicks"] || 0,
       awayCorners: awayStats["Corner Kicks"] || 0,
-      homePossession: homeStats["Ball Possession"] || null,
-      awayPossession: awayStats["Ball Possession"] || null,
+      homePossession: homeStats["Ball Possession"] ? String(homeStats["Ball Possession"]) : null,
+      awayPossession: awayStats["Ball Possession"] ? String(awayStats["Ball Possession"]) : null,
       homeShots: homeStats["Total Shots"] || null,
       awayShots: awayStats["Total Shots"] || null,
       homeShotsOnTarget: homeStats["Shots on Goal"] || null,
       awayShotsOnTarget: awayStats["Shots on Goal"] || null,
-    }).onConflictDoUpdate({
+    };
+
+    await db.insert(matches).values([matchValues as any]).onConflictDoUpdate({
       target: matches.apiId,
       set: {
         status: statusMap[fixture.status.short] || "scheduled",
         homeGoals: goals.home,
         awayGoals: goals.away,
-        homeXg: homeStats["Expected Goals"] || null,
-        awayXg: awayStats["Expected Goals"] || null,
+        homeXg: homeStats["Expected Goals"] ? String(homeStats["Expected Goals"]) : null,
+        awayXg: awayStats["Expected Goals"] ? String(awayStats["Expected Goals"]) : null,
         homeYellows: homeStats["Yellow Cards"] || 0,
         awayYellows: awayStats["Yellow Cards"] || 0,
         homeReds: homeStats["Red Cards"] || 0,
         awayReds: awayStats["Red Cards"] || 0,
         homeCorners: homeStats["Corner Kicks"] || 0,
         awayCorners: awayStats["Corner Kicks"] || 0,
-        homePossession: homeStats["Ball Possession"] || null,
-        awayPossession: awayStats["Ball Possession"] || null,
+        homePossession: homeStats["Ball Possession"] ? String(homeStats["Ball Possession"]) : null,
+        awayPossession: awayStats["Ball Possession"] ? String(awayStats["Ball Possession"]) : null,
         homeShots: homeStats["Total Shots"] || null,
         awayShots: awayStats["Total Shots"] || null,
         homeShotsOnTarget: homeStats["Shots on Goal"] || null,
@@ -312,7 +314,7 @@ async function computeTeamFormEntry(
   const first5 = allEntries.slice(0, 5);
   const first10 = allEntries.slice(0, 10);
 
-  await db.insert(teamForm).values({
+  await db.insert(teamForm).values([{
     teamId,
     matchId,
     matchDate,
@@ -348,7 +350,7 @@ async function computeTeamFormEntry(
     rolling10XgAgainst: first10.length >= 5 ? String(avg(first10.map(e => e.xgAgainst))) : null,
     rolling10GoalsFor: first10.length >= 5 ? String(avg(first10.map(e => e.goalsScored))) : null,
     rolling10GoalsAgainst: first10.length >= 5 ? String(avg(first10.map(e => e.goalsConceded))) : null,
-  });
+  } as any]);
 }
 
 export async function runIngestionPipeline(): Promise<{
@@ -357,7 +359,12 @@ export async function runIngestionPipeline(): Promise<{
   matches: number;
   formEntries: number;
 }> {
-  const results = { leagues: 0, teams: 0, matches: 0, formEntries: 0 };
+  const results = {
+    leagues: 0,
+    teams: 0,
+    matches: 0,
+    formEntries: 0,
+  };
 
   results.leagues = await ingestLeagues();
 
