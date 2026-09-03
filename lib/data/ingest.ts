@@ -149,6 +149,15 @@ export async function ingestTeams(leagueKey: string): Promise<number> {
   const teamMap = new Map<string, { apiId: string; name: string; logo?: string }>();
 
   for (const match of fixtures) {
+  // TEMPORARY DEBUG — log first match only
+  if (count === 0) {
+    console.log("[DEBUG] Full match object:");
+    console.log(JSON.stringify(match, null, 2));
+  }
+  
+  const homeTeam = match.home;
+  // ... rest of existing code
+
     if (match.home?.id && !teamMap.has(String(match.home.id))) {
       teamMap.set(String(match.home.id), {
         apiId: String(match.home.id),
