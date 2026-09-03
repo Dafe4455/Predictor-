@@ -6,7 +6,6 @@ import { MatchCard } from "@/components/matches/MatchCard";
 import { unstable_cache } from "next/cache";
 import { Calendar, Filter } from "lucide-react";
 
-// Force dynamic rendering - don't try to query DB at build time
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
@@ -35,6 +34,10 @@ const getTodayMatches = unstable_cache(
   { revalidate: 1800 }
 );
 
+interface MatchGroup {
+  [dateKey: string]: any[];
+}
+
 export default async function HomePage() {
   let matchesList: any[] = [];
   let error: string | null = null;
@@ -46,12 +49,12 @@ export default async function HomePage() {
     console.error("Home page error:", e);
   }
 
-  const grouped = matchesList.reduce((acc, match) => {
+  const grouped: MatchGroup = matchesList.reduce((acc: MatchGroup, match: any) => {
     const dateKey = format(new Date(match.matchDate), "yyyy-MM-dd");
     if (!acc[dateKey]) acc[dateKey] = [];
-    acc[dateKey].push(match as any);
+    acc[dateKey].push(match);
     return acc;
-  }, {} as Record<string, any[]>);
+  }, {});
 
   return (
     <main className="max-w-4xl mx-auto px-4 py-8">
@@ -81,7 +84,7 @@ export default async function HomePage() {
       </div>
 
       <div className="space-y-8">
-        {Object.entries(grouped).map(([dateKey, dayMatches]) => (
+        {Object.entries(grouped).map(([dateKey, dayMatches]: [string, any[]]) => (
           <section key={dateKey} id={dateKey}>
             <div className="flex items-center gap-2 mb-4">
               <Calendar className="w-4 h-4 text-gray-400" />
@@ -92,7 +95,7 @@ export default async function HomePage() {
               <span className="text-xs text-gray-400 font-medium">{dayMatches.length} matches</span>
             </div>
             <div className="space-y-3">
-              {dayMatches.map((match) => (
+              {dayMatches.map((match: any) => (
                 <MatchCard key={match.id} match={match} />
               ))}
             </div>
