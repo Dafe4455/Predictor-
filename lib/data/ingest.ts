@@ -1,6 +1,6 @@
 /**
- * Football data ingestion pipeline — BigBallsData version (auto-detect date)
- * Scans ALL fields on the match object to find anything that parses as a valid date.
+ * Football data ingestion pipeline — BigBallsData version (final)
+ * Date field: kickoff_utc
  */
 
 import { db } from "@/lib/db";
@@ -69,77 +69,33 @@ async function apiFetch(endpoint: string, params?: Record<string, string>): Prom
   return data;
 }
 
-// ─── Auto-detect date from ANY field on the object ──────────────
+// ─── Date parser — BigBallsData uses kickoff_utc ────────────────
 function parseMatchDate(match: any): Date {
-  // First: try all direct properties that look like dates
-  const directCandidates = [
-    "start_time", "date", "kickoff", "scheduled", "timestamp",
-    "created_at", "datetime", "time", "startTime", "startDate",
-    "kickoff_time", "match_date", "fixture_date", "event_date",
-    "utcDate", "utc_date", "begin_at", "beginAt", "scheduled_at",
-    "scheduledAt", "commence_time", "commenceTime", "eventTime",
+  const raw = match.kickoff_utc;
+  if (raw) {
+    const parsed = new Date(raw);
+    if (!isNaN(parsed.getTime())) {
+      return parsed;
+    }
+  }
+
+  // Fallbacks in case they change the field name
+  const fallbacks = [
+    match.start_time, match.date, match.kickoff, match.scheduled,
+    match.timestamp, match.datetime, match.time, match.startTime,
+    match.utcDate, match.begin_at, match.commence_time,
   ];
 
-  for (const key of directCandidates) {
-    const raw = match[key];
-    if (raw) {
-      const parsed = new Date(raw);
+  for (const fallback of fallbacks) {
+    if (fallback) {
+      const parsed = new Date(fallback);
       if (!isNaN(parsed.getTime())) {
         return parsed;
       }
     }
   }
 
-  // Second: try nested properties (e.g., match.fixture.date)
-  const nestedPaths = [
-    "fixture.date", "fixture.timestamp", "fixture.utcDate",
-    "event.date", "event.time", "match.date", "game.date",
-    "details.date", "info.date", "meta.date", "data.date",
-  ];
-
-  for (const path of nestedPaths) {
-    const parts = path.split(".");
-    let value: any = match;
-    for (const part of parts) {
-      value = value?.[part];
-      if (value === undefined) break;
-    }
-    if (value) {
-      const parsed = new Date(value);
-      if (!isNaN(parsed.getTime())) {
-        return parsed;
-      }
-    }
-  }
-
-  // Third: brute-force scan ALL string/number fields on the object
-  for (const [key, value] of Object.entries(match)) {
-    if (typeof value === "string" || typeof value === "number") {
-      const parsed = new Date(value as any);
-      if (!isNaN(parsed.getTime()) && parsed.getFullYear() >= 2020 && parsed.getFullYear() <= 2030) {
-        console.log(`[Date] Auto-detected date from field "${key}": ${value}`);
-        return parsed;
-      }
-    }
-  }
-
-  // Fourth: scan nested objects one level deep
-  for (const [topKey, topValue] of Object.entries(match)) {
-    if (topValue && typeof topValue === "object" && !Array.isArray(topValue)) {
-      for (const [subKey, subValue] of Object.entries(topValue as any)) {
-        if (typeof subValue === "string" || typeof subValue === "number") {
-          const parsed = new Date(subValue as any);
-          if (!isNaN(parsed.getTime()) && parsed.getFullYear() >= 2020 && parsed.getFullYear() <= 2030) {
-            console.log(`[Date] Auto-detected date from nested field "${topKey}.${subKey}": ${subValue}`);
-            return parsed;
-          }
-        }
-      }
-    }
-  }
-
-  // Log what we found for debugging
-  console.warn(`[Date] Could not find date for match ${match.id}. All top-level keys:`, Object.keys(match));
+  console.warn(`[Date] No valid date for match ${match.id}, using now`);
   return new Date();
 }
 
@@ -196,14 +152,14 @@ export async function ingestTeams(leagueKey: string): Promise<number> {
       teamMap.set(String(match.home.id), {
         apiId: String(match.home.id),
         name: match.home.name,
-        logo: match.home.logo,
+        logo: match.home.logo_url || match.home.logo,
       });
     }
     if (match.away?.id && !teamMap.has(String(match.away.id))) {
       teamMap.set(String(match.away.id), {
         apiId: String(match.away.id),
         name: match.away.name,
-        logo: match.away.logo,
+        logo: match.away.logo_url || match.away.logo,
       });
     }
   }
@@ -284,6 +240,7 @@ export async function ingestMatches(leagueKey: string): Promise<number> {
     const statusMap: Record<string, string> = {
       "finished": "finished",
       "live": "live",
+      "scheduled": "scheduled",
       "upcoming": "scheduled",
       "postponed": "postponed",
       "cancelled": "postponed",
@@ -307,8 +264,8 @@ export async function ingestMatches(leagueKey: string): Promise<number> {
       awayTeamId: awayDb.id,
       matchDate,
       status: mappedStatus,
-      venue: match.venue?.name || null,
-      referee: match.referee || null,
+      venue: null, // BigBallsData doesn't seem to have venue
+      referee: null,
       homeGoals: match.score?.home ?? null,
       awayGoals: match.score?.away ?? null,
       homeXg: homeStats.xg != null ? String(homeStats.xg) : null,
@@ -338,7 +295,7 @@ export async function ingestMatches(leagueKey: string): Promise<number> {
         homeYellows: homeStats.yellow_cards || 0,
         awayYellows: awayStats.yellow_cards || 0,
         homeReds: homeStats.red_cards || 0,
-        awayReds: homeStats.red_cards || 0,
+        awayReds: awayStats.red_cards || 0,
         homeCorners: homeStats.corners || 0,
         awayCorners: awayStats.corners || 0,
         homePossession: homeStats.possession != null ? String(homeStats.possession) : null,
