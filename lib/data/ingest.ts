@@ -1,6 +1,7 @@
 /**
- * Football data ingestion pipeline — BigBallsData version (fixed)
- * Free tier: 1,000 req/day (2,000 with GitHub link), 100 req/min burst
+ * Football data ingestion pipeline — BigBallsData version (timeout fix)
+ * Only fetches stats for FINISHED matches. Upcoming matches get null stats.
+ * This cuts API calls from ~250 to ~5-15 per run.
  */
 
 import { db } from "@/lib/db";
@@ -15,7 +16,6 @@ if (!API_KEY) {
 }
 
 // ─── League mapping ───────────────────────────────────────────
-// Keys verified against BigBallsData API. La Liga = "laliga" (no hyphen).
 const LEAGUE_CONFIG = [
   { key: "epl", name: "Premier League", country: "England" },
   { key: "laliga", name: "La Liga", country: "Spain" },
@@ -72,7 +72,6 @@ async function apiFetch(endpoint: string, params?: Record<string, string>): Prom
 
 // ─── Safe date parser ───────────────────────────────────────────
 function parseMatchDate(match: any): Date {
-  // BigBallsData uses various date fields. Try them in order of preference.
   const candidates = [
     match.start_time,
     match.date,
@@ -91,8 +90,7 @@ function parseMatchDate(match: any): Date {
     }
   }
 
-  // Fallback: log the raw match and use current date so pipeline doesn't crash
-  console.warn(`[Date] Could not parse date for match ${match.id}. Raw fields:`, {
+  console.warn(`[Date] Could not parse date for match ${match.id}. Fields:`, {
     start_time: match.start_time,
     date: match.date,
     kickoff: match.kickoff,
@@ -193,8 +191,13 @@ export async function ingestTeams(leagueKey: string): Promise<number> {
   return count;
 }
 
-// ─── Fetch match stats ─────────────────────────────────────────
-async function fetchMatchStats(matchApiId: string): Promise<Record<string, any>> {
+// ─── Fetch match stats (only for finished matches) ──────────────
+async function fetchMatchStats(matchApiId: string, matchStatus: string): Promise<Record<string, any>> {
+  // Skip stats for upcoming/live matches — they don't have meaningful stats yet
+  if (matchStatus !== "finished") {
+    return {};
+  }
+
   try {
     const data = await apiFetch(`/v1/stored/matches/${matchApiId}/stats`, { sport: "football" });
     return data.data || {};
@@ -221,6 +224,7 @@ export async function ingestMatches(leagueKey: string): Promise<number> {
 
   let count = 0;
   let skipped = 0;
+  let statsFetched = 0;
 
   for (const match of fixtures) {
     const homeTeam = match.home;
@@ -235,11 +239,7 @@ export async function ingestMatches(leagueKey: string): Promise<number> {
       continue;
     }
 
-    // Fetch detailed stats
-    const stats = await fetchMatchStats(String(match.id));
-    const homeStats = stats.home || {};
-    const awayStats = stats.away || {};
-
+    // Map BigBallsData status to our schema
     const statusMap: Record<string, string> = {
       "finished": "finished",
       "live": "live",
@@ -247,6 +247,14 @@ export async function ingestMatches(leagueKey: string): Promise<number> {
       "postponed": "postponed",
       "cancelled": "postponed",
     };
+    const mappedStatus = statusMap[match.status] || "scheduled";
+
+    // Only fetch stats for finished matches (saves ~90% of API calls)
+    const stats = await fetchMatchStats(String(match.id), mappedStatus);
+    if (mappedStatus === "finished") statsFetched++;
+
+    const homeStats = stats.home || {};
+    const awayStats = stats.away || {};
 
     const matchDate = parseMatchDate(match);
 
@@ -258,7 +266,7 @@ export async function ingestMatches(leagueKey: string): Promise<number> {
       homeTeamId: homeDb.id,
       awayTeamId: awayDb.id,
       matchDate,
-      status: statusMap[match.status] || "scheduled",
+      status: mappedStatus,
       venue: match.venue?.name || null,
       referee: match.referee || null,
       homeGoals: match.score?.home ?? null,
@@ -282,7 +290,7 @@ export async function ingestMatches(leagueKey: string): Promise<number> {
     await db.insert(matches).values([matchValues as any]).onConflictDoUpdate({
       target: matches.apiId,
       set: {
-        status: statusMap[match.status] || "scheduled",
+        status: mappedStatus,
         homeGoals: match.score?.home ?? null,
         awayGoals: match.score?.away ?? null,
         homeXg: homeStats.xg != null ? String(homeStats.xg) : null,
@@ -305,7 +313,7 @@ export async function ingestMatches(leagueKey: string): Promise<number> {
     count++;
   }
 
-  console.log(`[Matches] Upserted ${count}, skipped ${skipped} for league ${leagueKey}`);
+  console.log(`[Matches] Upserted ${count}, skipped ${skipped}, stats fetched for ${statsFetched} finished matches`);
   return count;
 }
 
@@ -476,7 +484,6 @@ export async function runIngestionPipeline(): Promise<{
       const matchesCount = await ingestMatches(config.key);
       results.matches += matchesCount;
       apiCalls += 1;
-      apiCalls += matchesCount;
       console.log(`[Pipeline] ${config.key}: ${matchesCount} matches`);
     } catch (error) {
       const msg = `League ${config.key}: ${error}`;
