@@ -244,7 +244,8 @@ export async function batchComputePredictions(): Promise<number> {
         leagueId: match.leagueId,
       });
 
-      await db.insert(predictions).values({
+      await db.insert(predictions).values([{
+
         matchId: result.matchId,
         modelVersion: "v1.0",
         predictedHomeXg: String(result.predictedHomeXg),
@@ -269,7 +270,8 @@ export async function batchComputePredictions(): Promise<number> {
         underYellows45: String(result.underYellows45),
         confidenceScore: String(result.confidenceScore),
         featuresUsed: result.featuresUsed,
-      }).onConflictDoUpdate({
+      }] as any).onConflictDoUpdate({
+
         target: predictions.matchId,
         set: {
           modelVersion: "v1.0",
