@@ -18,7 +18,7 @@ export const leagues = pgTable("leagues", {
   apiId: varchar("api_id", { length: 50 }).notNull().unique(),
   name: varchar("name", { length: 100 }).notNull(),
   country: varchar("country", { length: 50 }),
-  countryCode: varchar("country_code", { length: 5 }),
+  countryCode: varchar("country_code", { length: 10 }),
   logo: varchar("logo", { length: 255 }),
   flag: varchar("flag", { length: 255 }),
   tier: integer("tier").default(1),
