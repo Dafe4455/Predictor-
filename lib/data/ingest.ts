@@ -1,7 +1,5 @@
 /**
- * Football data ingestion pipeline — BigBallsData version (timeout fix)
- * Only fetches stats for FINISHED matches. Upcoming matches get null stats.
- * This cuts API calls from ~250 to ~5-15 per run.
+ * Football data ingestion pipeline — BigBallsData version (debug + date fix)
  */
 
 import { db } from "@/lib/db";
@@ -70,8 +68,9 @@ async function apiFetch(endpoint: string, params?: Record<string, string>): Prom
   return data;
 }
 
-// ─── Safe date parser ───────────────────────────────────────────
+// ─── Safe date parser — tries EVERY possible field ───────────────
 function parseMatchDate(match: any): Date {
+  // Try every conceivable date field name
   const candidates = [
     match.start_time,
     match.date,
@@ -79,6 +78,29 @@ function parseMatchDate(match: any): Date {
     match.scheduled,
     match.timestamp,
     match.created_at,
+    match.datetime,
+    match.time,
+    match.startTime,
+    match.startDate,
+    match.kickoff_time,
+    match.match_date,
+    match.fixture_date,
+    match.event_date,
+    match.utcDate,
+    match.utc_date,
+    match.begin_at,
+    match.beginAt,
+    match.scheduled_at,
+    match.scheduledAt,
+    // Nested possibilities
+    match.fixture?.date,
+    match.fixture?.timestamp,
+    match.fixture?.utcDate,
+    match.event?.date,
+    match.match?.date,
+    match.game?.date,
+    match.details?.date,
+    match.info?.date,
   ];
 
   for (const raw of candidates) {
@@ -90,13 +112,9 @@ function parseMatchDate(match: any): Date {
     }
   }
 
-  console.warn(`[Date] Could not parse date for match ${match.id}. Fields:`, {
-    start_time: match.start_time,
-    date: match.date,
-    kickoff: match.kickoff,
-    scheduled: match.scheduled,
-    timestamp: match.timestamp,
-  });
+  // Log ALL keys to help debug
+  console.warn(`[Date] Could not parse date for match ${match.id}. ALL keys:`, Object.keys(match));
+  console.warn(`[Date] Full match (first 2000 chars):`, JSON.stringify(match).slice(0, 2000));
   return new Date();
 }
 
@@ -146,18 +164,15 @@ export async function ingestTeams(leagueKey: string): Promise<number> {
     return 0;
   }
 
+  // DEBUG: Log first match structure
+  if (fixtures[0]) {
+    console.log("[DEBUG-TEAMS] First match keys:", Object.keys(fixtures[0]));
+    console.log("[DEBUG-TEAMS] First match sample:", JSON.stringify(fixtures[0], null, 2).slice(0, 1500));
+  }
+
   const teamMap = new Map<string, { apiId: string; name: string; logo?: string }>();
 
-  let loggedFirstMatch = false;
-for (const match of fixtures) {
-  if (!loggedFirstMatch) {
-    console.log("[DEBUG] Full match object:");
-    console.log(JSON.stringify(match, null, 2));
-    loggedFirstMatch = true;
-  }
-  // ... rest of code
-
-
+  for (const match of fixtures) {
     if (match.home?.id && !teamMap.has(String(match.home.id))) {
       teamMap.set(String(match.home.id), {
         apiId: String(match.home.id),
@@ -202,7 +217,6 @@ for (const match of fixtures) {
 
 // ─── Fetch match stats (only for finished matches) ──────────────
 async function fetchMatchStats(matchApiId: string, matchStatus: string): Promise<Record<string, any>> {
-  // Skip stats for upcoming/live matches — they don't have meaningful stats yet
   if (matchStatus !== "finished") {
     return {};
   }
@@ -231,6 +245,12 @@ export async function ingestMatches(leagueKey: string): Promise<number> {
     return 0;
   }
 
+  // DEBUG: Log first match structure
+  if (fixtures[0]) {
+    console.log("[DEBUG-MATCHES] First match keys:", Object.keys(fixtures[0]));
+    console.log("[DEBUG-MATCHES] First match sample:", JSON.stringify(fixtures[0], null, 2).slice(0, 1500));
+  }
+
   let count = 0;
   let skipped = 0;
   let statsFetched = 0;
@@ -248,7 +268,6 @@ export async function ingestMatches(leagueKey: string): Promise<number> {
       continue;
     }
 
-    // Map BigBallsData status to our schema
     const statusMap: Record<string, string> = {
       "finished": "finished",
       "live": "live",
@@ -258,7 +277,6 @@ export async function ingestMatches(leagueKey: string): Promise<number> {
     };
     const mappedStatus = statusMap[match.status] || "scheduled";
 
-    // Only fetch stats for finished matches (saves ~90% of API calls)
     const stats = await fetchMatchStats(String(match.id), mappedStatus);
     if (mappedStatus === "finished") statsFetched++;
 
@@ -305,7 +323,7 @@ export async function ingestMatches(leagueKey: string): Promise<number> {
         homeXg: homeStats.xg != null ? String(homeStats.xg) : null,
         awayXg: awayStats.xg != null ? String(awayStats.xg) : null,
         homeYellows: homeStats.yellow_cards || 0,
-        awayYellows: awayStats.yellow_cards || 0,
+        awayYellows: homeStats.yellow_cards || 0,
         homeReds: homeStats.red_cards || 0,
         awayReds: awayStats.red_cards || 0,
         homeCorners: homeStats.corners || 0,
