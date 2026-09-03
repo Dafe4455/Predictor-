@@ -1,3 +1,8 @@
+/**
+ * Prediction engine with fallback for missing form data
+ * When no historical form exists, uses league averages as baseline
+ */
+
 import { db } from "@/lib/db";
 import { matches, teamForm, predictions } from "@/lib/db/schema";
 import { eq, and, desc, gte, sql } from "drizzle-orm";
@@ -94,6 +99,22 @@ async function getLeagueAverages(leagueId: number | null): Promise<LeagueAverage
   };
 }
 
+// ─── Fallback form data generator ─────────────────────────────
+function createFallbackForm(leagueAverages: LeagueAverages, venue: "home" | "away") {
+  const isHome = venue === "home";
+  return {
+    xgFor: isHome ? leagueAverages.avgHomeXg : leagueAverages.avgAwayXg,
+    xgAgainst: isHome ? leagueAverages.avgAwayXg : leagueAverages.avgHomeXg,
+    goalsScored: isHome ? leagueAverages.avgHomeGoals : leagueAverages.avgAwayGoals,
+    goalsConceded: isHome ? leagueAverages.avgAwayGoals : leagueAverages.avgHomeGoals,
+    cornersFor: leagueAverages.avgTotalCorners / 2,
+    cornersAgainst: leagueAverages.avgTotalCorners / 2,
+    possession: 50,
+    shots: 12,
+    yellows: leagueAverages.avgTotalYellows / 2,
+  };
+}
+
 export async function computeMatchPrediction(
   input: PredictionInput
 ): Promise<PredictionResult> {
@@ -104,12 +125,17 @@ export async function computeMatchPrediction(
     getTeamForm(awayTeamId, "away", 10),
   ]);
 
-  if (homeFormData.length < 3 || awayFormData.length < 3) {
-    throw new Error(`Insufficient form data: home=${homeFormData.length}, away=${awayFormData.length}`);
-  }
+  const leagueAverages = await getLeagueAverages(leagueId);
 
-  const home5 = homeFormData.slice(0, 5);
-  const away5 = awayFormData.slice(0, 5);
+  // Use fallback data if insufficient form (fresh database / new season)
+  const hasHomeForm = homeFormData.length >= 3;
+  const hasAwayForm = awayFormData.length >= 3;
+
+  const homeFallback = createFallbackForm(leagueAverages, "home");
+  const awayFallback = createFallbackForm(leagueAverages, "away");
+
+  const home5 = hasHomeForm ? homeFormData.slice(0, 5) : [homeFallback, homeFallback, homeFallback];
+  const away5 = hasAwayForm ? awayFormData.slice(0, 5) : [awayFallback, awayFallback, awayFallback];
 
   const avg = (arr: number[]) => arr.reduce((a, b) => a + b, 0) / arr.length;
 
@@ -117,8 +143,6 @@ export async function computeMatchPrediction(
   const homeDefense = avg(home5.map(f => Number(f.xgAgainst) || Number(f.goalsConceded) || 0));
   const awayAttack = avg(away5.map(f => Number(f.xgFor) || Number(f.goalsScored) || 0));
   const awayDefense = avg(away5.map(f => Number(f.xgAgainst) || Number(f.goalsConceded) || 0));
-
-  const leagueAverages = await getLeagueAverages(leagueId);
 
   const homeAttackStrength = homeAttack / leagueAverages.avgHomeXg;
   const homeDefenseStrength = homeDefense / leagueAverages.avgAwayXg;
@@ -184,6 +208,11 @@ export async function computeMatchPrediction(
     awayFormData.length
   );
 
+  // Lower confidence when using fallback data
+  const adjustedConfidence = (hasHomeForm && hasAwayForm) 
+    ? confidence 
+    : Math.min(confidence, 0.45); // Cap at 45% when using averages
+
   const scoreProbs: Record<string, number> = {};
   topScores.forEach(({ score, probability }) => {
     scoreProbs[score] = Math.round(probability * 10000) / 10000;
@@ -211,10 +240,11 @@ export async function computeMatchPrediction(
     overYellows45: cardPred.over45,
     underYellows35: cardPred.under35,
     underYellows45: cardPred.under45,
-    confidenceScore: confidence,
+    confidenceScore: adjustedConfidence,
     featuresUsed: {
       homeFormGames: homeFormData.length,
       awayFormGames: awayFormData.length,
+      usingFallback: !hasHomeForm || !hasAwayForm,
       homeAttackStrength: Math.round(homeAttackStrength * 100) / 100,
       awayAttackStrength: Math.round(awayAttackStrength * 100) / 100,
       leagueAvgHomeXg: leagueAverages.avgHomeXg,
@@ -245,7 +275,6 @@ export async function batchComputePredictions(): Promise<number> {
       });
 
       await db.insert(predictions).values([{
-
         matchId: result.matchId,
         modelVersion: "v1.0",
         predictedHomeXg: String(result.predictedHomeXg),
@@ -269,9 +298,8 @@ export async function batchComputePredictions(): Promise<number> {
         underYellows35: String(result.underYellows35),
         underYellows45: String(result.underYellows45),
         confidenceScore: String(result.confidenceScore),
-              featuresUsed: result.featuresUsed,
-    }] as any).onConflictDoUpdate({
-
+        featuresUsed: result.featuresUsed,
+      }] as any).onConflictDoUpdate({
         target: predictions.matchId,
         set: {
           modelVersion: "v1.0",
