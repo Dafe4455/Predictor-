@@ -87,8 +87,8 @@ export async function GET(
       underYellows35: String(result.underYellows35),
       underYellows45: String(result.underYellows45),
       confidenceScore: String(result.confidenceScore),
-      featuresUsed: result.featuresUsed,
-    }).onConflictDoUpdate({
+            featuresUsed: result.featuresUsed,
+    }] as any).onConflictDoUpdate({
 
       target: predictions.matchId,
       set: {
