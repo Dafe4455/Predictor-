@@ -1,8 +1,6 @@
 /**
- * Football data ingestion pipeline — BigBallsData version
+ * Football data ingestion pipeline — BigBallsData version (fixed)
  * Free tier: 1,000 req/day (2,000 with GitHub link), 100 req/min burst
- * Covers: Premier League, La Liga, Serie A, Bundesliga, Ligue 1
- * Includes: live scores, xG, possession, shots, corners, cards, lineups
  */
 
 import { db } from "@/lib/db";
@@ -17,9 +15,10 @@ if (!API_KEY) {
 }
 
 // ─── League mapping ───────────────────────────────────────────
+// Keys verified against BigBallsData API. La Liga = "laliga" (no hyphen).
 const LEAGUE_CONFIG = [
   { key: "epl", name: "Premier League", country: "England" },
-  { key: "la-liga", name: "La Liga", country: "Spain" },
+  { key: "laliga", name: "La Liga", country: "Spain" },
   { key: "serie-a", name: "Serie A", country: "Italy" },
   { key: "bundesliga", name: "Bundesliga", country: "Germany" },
   { key: "ligue-1", name: "Ligue 1", country: "France" },
@@ -27,7 +26,7 @@ const LEAGUE_CONFIG = [
 
 // ─── Rate limiter ─────────────────────────────────────────────
 let lastRequestTime = 0;
-const MIN_REQUEST_INTERVAL_MS = 650; // ~92 req/min (safe under 100/min)
+const MIN_REQUEST_INTERVAL_MS = 650;
 
 async function rateLimitDelay() {
   const now = Date.now();
@@ -71,6 +70,38 @@ async function apiFetch(endpoint: string, params?: Record<string, string>): Prom
   return data;
 }
 
+// ─── Safe date parser ───────────────────────────────────────────
+function parseMatchDate(match: any): Date {
+  // BigBallsData uses various date fields. Try them in order of preference.
+  const candidates = [
+    match.start_time,
+    match.date,
+    match.kickoff,
+    match.scheduled,
+    match.timestamp,
+    match.created_at,
+  ];
+
+  for (const raw of candidates) {
+    if (raw) {
+      const parsed = new Date(raw);
+      if (!isNaN(parsed.getTime())) {
+        return parsed;
+      }
+    }
+  }
+
+  // Fallback: log the raw match and use current date so pipeline doesn't crash
+  console.warn(`[Date] Could not parse date for match ${match.id}. Raw fields:`, {
+    start_time: match.start_time,
+    date: match.date,
+    kickoff: match.kickoff,
+    scheduled: match.scheduled,
+    timestamp: match.timestamp,
+  });
+  return new Date();
+}
+
 // ─── Ingest leagues ─────────────────────────────────────────────
 export async function ingestLeagues(): Promise<number> {
   let count = 0;
@@ -103,15 +134,12 @@ export async function ingestLeagues(): Promise<number> {
 }
 
 // ─── Ingest teams ─────────────────────────────────────────────
-// BigBallsData doesn't have a direct /teams endpoint per league.
-// We extract unique teams from the matches list and upsert them.
 export async function ingestTeams(leagueKey: string): Promise<number> {
   const [leagueRow] = await db.select().from(leagues).where(eq(leagues.apiId, leagueKey)).limit(1);
   if (!leagueRow) {
     throw new Error(`League ${leagueKey} not in DB`);
   }
 
-  // Fetch recent matches to extract teams
   const data = await apiFetch("/v1/matches", { sport: "football", league: leagueKey });
   const fixtures = data.data || [];
 
@@ -165,7 +193,7 @@ export async function ingestTeams(leagueKey: string): Promise<number> {
   return count;
 }
 
-// ─── Fetch match stats (xG, possession, shots, etc.) ────────────
+// ─── Fetch match stats ─────────────────────────────────────────
 async function fetchMatchStats(matchApiId: string): Promise<Record<string, any>> {
   try {
     const data = await apiFetch(`/v1/stored/matches/${matchApiId}/stats`, { sport: "football" });
@@ -207,7 +235,7 @@ export async function ingestMatches(leagueKey: string): Promise<number> {
       continue;
     }
 
-    // Fetch detailed stats (xG, possession, shots, etc.)
+    // Fetch detailed stats
     const stats = await fetchMatchStats(String(match.id));
     const homeStats = stats.home || {};
     const awayStats = stats.away || {};
@@ -220,6 +248,8 @@ export async function ingestMatches(leagueKey: string): Promise<number> {
       "cancelled": "postponed",
     };
 
+    const matchDate = parseMatchDate(match);
+
     const matchValues = {
       apiId: String(match.id),
       leagueId: leagueRow.id,
@@ -227,7 +257,7 @@ export async function ingestMatches(leagueKey: string): Promise<number> {
       round: match.round || null,
       homeTeamId: homeDb.id,
       awayTeamId: awayDb.id,
-      matchDate: new Date(match.date || match.start_time),
+      matchDate,
       status: statusMap[match.status] || "scheduled",
       venue: match.venue?.name || null,
       referee: match.referee || null,
@@ -420,7 +450,6 @@ export async function runIngestionPipeline(): Promise<{
   console.log("[Pipeline] ===== Starting BigBallsData ingestion =====");
   console.log(`[Pipeline] API_KEY present: ${!!API_KEY}`);
 
-  // Step 1: Leagues (0 API calls — hardcoded)
   try {
     results.leagues = await ingestLeagues();
     console.log(`[Pipeline] Leagues: ${results.leagues}`);
@@ -430,12 +459,10 @@ export async function runIngestionPipeline(): Promise<{
     errors.push(msg);
   }
 
-  // Step 2 & 3: Teams + Matches per league
   for (const config of LEAGUE_CONFIG) {
     try {
       console.log(`[Pipeline] --- League ${config.key} ---`);
 
-      // Teams extracted from matches (1 call)
       const teamsCount = await ingestTeams(config.key);
       results.teams += teamsCount;
       apiCalls += 1;
@@ -446,11 +473,10 @@ export async function runIngestionPipeline(): Promise<{
         continue;
       }
 
-      // Matches (1 call) + stats per match (N calls)
       const matchesCount = await ingestMatches(config.key);
       results.matches += matchesCount;
-      apiCalls += 1; // matches list
-      apiCalls += matchesCount; // stats per match
+      apiCalls += 1;
+      apiCalls += matchesCount;
       console.log(`[Pipeline] ${config.key}: ${matchesCount} matches`);
     } catch (error) {
       const msg = `League ${config.key}: ${error}`;
@@ -459,7 +485,6 @@ export async function runIngestionPipeline(): Promise<{
     }
   }
 
-  // Step 4: Form (0 API calls)
   try {
     results.formEntries = await computeForm();
     console.log(`[Pipeline] Form entries: ${results.formEntries}`);
