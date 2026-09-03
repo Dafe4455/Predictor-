@@ -62,7 +62,8 @@ export async function GET(
       leagueId: match.leagueId,
     });
 
-    await db.insert(predictions).values({
+    await db.insert(predictions).values([{
+
       matchId: result.matchId,
       modelVersion: "v1.0",
       predictedHomeXg: String(result.predictedHomeXg),
@@ -88,6 +89,7 @@ export async function GET(
       confidenceScore: String(result.confidenceScore),
       featuresUsed: result.featuresUsed,
     }).onConflictDoUpdate({
+
       target: predictions.matchId,
       set: {
         predictedHomeXg: String(result.predictedHomeXg),
