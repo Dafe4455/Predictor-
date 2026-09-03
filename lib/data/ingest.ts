@@ -1,244 +1,285 @@
 /**
- * Football data ingestion pipeline
+ * Football data ingestion pipeline — BigBallsData version
+ * Free tier: 1,000 req/day (2,000 with GitHub link), 100 req/min burst
+ * Covers: Premier League, La Liga, Serie A, Bundesliga, Ligue 1
+ * Includes: live scores, xG, possession, shots, corners, cards, lineups
  */
 
 import { db } from "@/lib/db";
 import { matches, teams, leagues, teamForm } from "@/lib/db/schema";
 import { eq, and, sql } from "drizzle-orm";
 
-const API_BASE = process.env.FOOTBALL_API_BASE || "https://v3.football.api-sports.io";
-const API_KEY = process.env.FOOTBALL_API_KEY;
+const API_BASE = "https://api.bigballsdata.com";
+const API_KEY = process.env.BIGBALLSDATA_API_KEY;
 
-interface ApiMatch {
-  fixture: {
-    id: number;
-    date: string;
-    status: { short: string; long: string };
-    venue: { name: string; city: string };
-    referee: string;
-  };
-  league: {
-    id: number;
-    name: string;
-    country: string;
-    logo: string;
-    flag: string;
-    season: number;
-    round: string;
-  };
-  teams: {
-    home: { id: number; name: string; logo: string; winner: boolean | null };
-    away: { id: number; name: string; logo: string; winner: boolean | null };
-  };
-  goals: { home: number | null; away: number | null };
-  statistics?: Array<{
-    team: { id: number; name: string };
-    statistics: Array<{ type: string; value: number | string | null }>;
-  }>;
+if (!API_KEY) {
+  console.error("[Ingest] CRITICAL: BIGBALLSDATA_API_KEY is not set!");
 }
 
-async function apiFetch(endpoint: string, params: Record<string, string> = {}) {
+// ─── League mapping ───────────────────────────────────────────
+const LEAGUE_CONFIG = [
+  { key: "epl", name: "Premier League", country: "England" },
+  { key: "la-liga", name: "La Liga", country: "Spain" },
+  { key: "serie-a", name: "Serie A", country: "Italy" },
+  { key: "bundesliga", name: "Bundesliga", country: "Germany" },
+  { key: "ligue-1", name: "Ligue 1", country: "France" },
+];
+
+// ─── Rate limiter ─────────────────────────────────────────────
+let lastRequestTime = 0;
+const MIN_REQUEST_INTERVAL_MS = 650; // ~92 req/min (safe under 100/min)
+
+async function rateLimitDelay() {
+  const now = Date.now();
+  const elapsed = now - lastRequestTime;
+  if (elapsed < MIN_REQUEST_INTERVAL_MS) {
+    await new Promise(r => setTimeout(r, MIN_REQUEST_INTERVAL_MS - elapsed));
+  }
+  lastRequestTime = Date.now();
+}
+
+// ─── API fetch ──────────────────────────────────────────────────
+async function apiFetch(endpoint: string, params?: Record<string, string>): Promise<any> {
+  await rateLimitDelay();
+
   const url = new URL(`${API_BASE}${endpoint}`);
-  Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
+  if (params) {
+    Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
+  }
+
+  console.log(`[API] ${endpoint}${params ? " → " + url.searchParams.toString() : ""}`);
 
   const response = await fetch(url.toString(), {
     headers: {
-      "x-apisports-key": API_KEY || "",
+      "Authorization": `Bearer ${API_KEY}`,
       "Content-Type": "application/json",
     },
-    next: { revalidate: 3600 },
   });
 
   if (!response.ok) {
-    throw new Error(`API error: ${response.status} ${response.statusText}`);
+    const text = await response.text().catch(() => "");
+    throw new Error(`HTTP ${response.status} — ${text}`);
   }
 
   const data = await response.json();
-  return data.response || [];
+
+  if (data.error) {
+    throw new Error(`API error: ${JSON.stringify(data.error)}`);
+  }
+
+  console.log(`[API] ${endpoint} → ${data.data?.length ?? "?"} results`);
+  return data;
 }
 
-const TARGET_LEAGUE_IDS = [39, 140, 135, 78, 61]; // Premier League, La Liga, Serie A, Bundesliga, Ligue 1
-
+// ─── Ingest leagues ─────────────────────────────────────────────
 export async function ingestLeagues(): Promise<number> {
   let count = 0;
 
-  for (const leagueId of TARGET_LEAGUE_IDS) {
-    const leaguesData = await apiFetch("/leagues", { id: String(leagueId) });
-    if (!leaguesData.length) continue;
-
-    const item = leaguesData[0];
-    const league = item.league;
-    const country = item.country;
-
-    await db.insert(leagues).values([{
-      apiId: String(league.id),
-      name: league.name,
-      country: country.name,
-      countryCode: country.code,
-      logo: league.logo,
-      flag: country.flag,
-      isActive: true,
-    }]).onConflictDoUpdate({
-      target: leagues.apiId,
-      set: {
-        name: league.name,
-        country: country.name,
-        logo: league.logo,
-        flag: country.flag,
-      },
-    });
-    count++;
+  for (const config of LEAGUE_CONFIG) {
+    try {
+      await db.insert(leagues).values([{
+        apiId: config.key,
+        name: config.name,
+        country: config.country,
+        countryCode: null,
+        logo: null,
+        flag: null,
+        isActive: true,
+      }]).onConflictDoUpdate({
+        target: leagues.apiId,
+        set: {
+          name: config.name,
+          country: config.country,
+        },
+      });
+      count++;
+      console.log(`[Leagues] Upserted: ${config.name} (${config.key})`);
+    } catch (error) {
+      console.error(`[Leagues] FAILED ${config.key}:`, error);
+    }
   }
 
   return count;
-      }
+}
 
-export async function ingestTeams(leagueApiId: string, season: string): Promise<number> {
-  const teamsData = await apiFetch("/teams", { league: leagueApiId, season });
+// ─── Ingest teams ─────────────────────────────────────────────
+// BigBallsData doesn't have a direct /teams endpoint per league.
+// We extract unique teams from the matches list and upsert them.
+export async function ingestTeams(leagueKey: string): Promise<number> {
+  const [leagueRow] = await db.select().from(leagues).where(eq(leagues.apiId, leagueKey)).limit(1);
+  if (!leagueRow) {
+    throw new Error(`League ${leagueKey} not in DB`);
+  }
+
+  // Fetch recent matches to extract teams
+  const data = await apiFetch("/v1/matches", { sport: "football", league: leagueKey });
+  const fixtures = data.data || [];
+
+  if (!fixtures.length) {
+    console.warn(`[Teams] No matches found for league ${leagueKey}`);
+    return 0;
+  }
+
+  const teamMap = new Map<string, { apiId: string; name: string; logo?: string }>();
+
+  for (const match of fixtures) {
+    if (match.home?.id && !teamMap.has(String(match.home.id))) {
+      teamMap.set(String(match.home.id), {
+        apiId: String(match.home.id),
+        name: match.home.name,
+        logo: match.home.logo,
+      });
+    }
+    if (match.away?.id && !teamMap.has(String(match.away.id))) {
+      teamMap.set(String(match.away.id), {
+        apiId: String(match.away.id),
+        name: match.away.name,
+        logo: match.away.logo,
+      });
+    }
+  }
 
   let count = 0;
-  for (const item of teamsData) {
-    const team = item.team;
-    const venue = item.venue;
-
-    const league = await db.select().from(leagues).where(eq(leagues.apiId, leagueApiId)).limit(1);
-    const leagueId = league[0]?.id;
-
+  for (const team of teamMap.values()) {
     await db.insert(teams).values([{
-      apiId: String(team.id),
+      apiId: team.apiId,
       name: team.name,
-      shortName: team.code || team.name.slice(0, 20),
-      country: team.country,
-      leagueId,
-      logo: team.logo,
-      founded: team.founded,
-      venueName: venue?.name,
-      venueCapacity: venue?.capacity,
+      shortName: team.name.slice(0, 20),
+      country: null,
+      leagueId: leagueRow.id,
+      logo: team.logo || null,
+      founded: null,
+      venueName: null,
+      venueCapacity: null,
     }]).onConflictDoUpdate({
       target: teams.apiId,
       set: {
         name: team.name,
-        shortName: team.code || team.name.slice(0, 20),
-        logo: team.logo,
-        venueName: venue?.name,
-        venueCapacity: venue?.capacity,
+        logo: team.logo || null,
       },
     });
     count++;
   }
 
+  console.log(`[Teams] Upserted ${count} teams for league ${leagueKey}`);
   return count;
 }
 
-export async function ingestMatches(
-  leagueApiId: string,
-  season: string,
-  from?: string,
-  to?: string
-): Promise<number> {
-  const params: Record<string, string> = { league: leagueApiId, season };
-  if (from) params.from = from;
-  if (to) params.to = to;
+// ─── Fetch match stats (xG, possession, shots, etc.) ────────────
+async function fetchMatchStats(matchApiId: string): Promise<Record<string, any>> {
+  try {
+    const data = await apiFetch(`/v1/stored/matches/${matchApiId}/stats`, { sport: "football" });
+    return data.data || {};
+  } catch (error) {
+    console.warn(`[Stats] Failed to fetch stats for match ${matchApiId}:`, error);
+    return {};
+  }
+}
 
-  const matchesData: ApiMatch[] = await apiFetch("/fixtures", params);
+// ─── Ingest matches ───────────────────────────────────────────
+export async function ingestMatches(leagueKey: string): Promise<number> {
+  const [leagueRow] = await db.select().from(leagues).where(eq(leagues.apiId, leagueKey)).limit(1);
+  if (!leagueRow) {
+    throw new Error(`League ${leagueKey} not in DB`);
+  }
+
+  const data = await apiFetch("/v1/matches", { sport: "football", league: leagueKey });
+  const fixtures = data.data || [];
+
+  if (!fixtures.length) {
+    console.warn(`[Matches] No matches for league ${leagueKey}`);
+    return 0;
+  }
 
   let count = 0;
-  for (const item of matchesData) {
-    const fixture = item.fixture;
-    const league = item.league;
-    const homeTeam = item.teams.home;
-    const awayTeam = item.teams.away;
-    const goals = item.goals;
+  let skipped = 0;
+
+  for (const match of fixtures) {
+    const homeTeam = match.home;
+    const awayTeam = match.away;
 
     const [homeDb] = await db.select().from(teams).where(eq(teams.apiId, String(homeTeam.id))).limit(1);
     const [awayDb] = await db.select().from(teams).where(eq(teams.apiId, String(awayTeam.id))).limit(1);
-    const [leagueDb] = await db.select().from(leagues).where(eq(leagues.apiId, String(league.id))).limit(1);
 
     if (!homeDb || !awayDb) {
-      console.warn(`Skipping match ${fixture.id}: teams not found`);
+      console.warn(`[Matches] Skipping ${match.id}: teams not in DB (${homeTeam.id}, ${awayTeam.id})`);
+      skipped++;
       continue;
     }
 
-    let homeStats: Record<string, number> = {};
-    let awayStats: Record<string, number> = {};
-
-    if (item.statistics) {
-      for (const stat of item.statistics) {
-        const isHome = stat.team.id === homeTeam.id;
-        const target = isHome ? homeStats : awayStats;
-        for (const s of stat.statistics) {
-          const val = typeof s.value === "string" ? parseFloat(s.value) || 0 : (s.value || 0);
-          target[s.type] = val;
-        }
-      }
-    }
+    // Fetch detailed stats (xG, possession, shots, etc.)
+    const stats = await fetchMatchStats(String(match.id));
+    const homeStats = stats.home || {};
+    const awayStats = stats.away || {};
 
     const statusMap: Record<string, string> = {
-      "FT": "finished", "AET": "finished", "PEN": "finished",
-      "NS": "scheduled", "TBD": "scheduled",
-      "LIVE": "live", "1H": "live", "HT": "live", "2H": "live", "ET": "live", "P": "live",
-      "SUSP": "postponed", "INT": "postponed", "PST": "postponed",
-      "CANC": "postponed", "ABD": "postponed", "AWD": "postponed", "WO": "postponed",
+      "finished": "finished",
+      "live": "live",
+      "upcoming": "scheduled",
+      "postponed": "postponed",
+      "cancelled": "postponed",
     };
 
     const matchValues = {
-      apiId: String(fixture.id),
-      leagueId: leagueDb?.id ?? null,
-      season: String(league.season),
-      round: parseInt(league.round?.replace(/\D/g, "")) || null,
+      apiId: String(match.id),
+      leagueId: leagueRow.id,
+      season: String(new Date().getFullYear()),
+      round: match.round || null,
       homeTeamId: homeDb.id,
       awayTeamId: awayDb.id,
-      matchDate: new Date(fixture.date),
-      status: statusMap[fixture.status.short] || "scheduled",
-      venue: fixture.venue?.name || null,
-      referee: fixture.referee || null,
-      homeGoals: goals.home,
-      awayGoals: goals.away,
-      homeXg: homeStats["Expected Goals"] ? String(homeStats["Expected Goals"]) : null,
-      awayXg: awayStats["Expected Goals"] ? String(awayStats["Expected Goals"]) : null,
-      homeYellows: homeStats["Yellow Cards"] || 0,
-      awayYellows: awayStats["Yellow Cards"] || 0,
-      homeReds: homeStats["Red Cards"] || 0,
-      awayReds: awayStats["Red Cards"] || 0,
-      homeCorners: homeStats["Corner Kicks"] || 0,
-      awayCorners: awayStats["Corner Kicks"] || 0,
-      homePossession: homeStats["Ball Possession"] ? String(homeStats["Ball Possession"]) : null,
-      awayPossession: awayStats["Ball Possession"] ? String(awayStats["Ball Possession"]) : null,
-      homeShots: homeStats["Total Shots"] || null,
-      awayShots: awayStats["Total Shots"] || null,
-      homeShotsOnTarget: homeStats["Shots on Goal"] || null,
-      awayShotsOnTarget: awayStats["Shots on Goal"] || null,
+      matchDate: new Date(match.date || match.start_time),
+      status: statusMap[match.status] || "scheduled",
+      venue: match.venue?.name || null,
+      referee: match.referee || null,
+      homeGoals: match.score?.home ?? null,
+      awayGoals: match.score?.away ?? null,
+      homeXg: homeStats.xg != null ? String(homeStats.xg) : null,
+      awayXg: awayStats.xg != null ? String(awayStats.xg) : null,
+      homeYellows: homeStats.yellow_cards || 0,
+      awayYellows: awayStats.yellow_cards || 0,
+      homeReds: homeStats.red_cards || 0,
+      awayReds: awayStats.red_cards || 0,
+      homeCorners: homeStats.corners || 0,
+      awayCorners: awayStats.corners || 0,
+      homePossession: homeStats.possession != null ? String(homeStats.possession) : null,
+      awayPossession: awayStats.possession != null ? String(awayStats.possession) : null,
+      homeShots: homeStats.shots || null,
+      awayShots: awayStats.shots || null,
+      homeShotsOnTarget: homeStats.shots_on_target || null,
+      awayShotsOnTarget: awayStats.shots_on_target || null,
     };
 
     await db.insert(matches).values([matchValues as any]).onConflictDoUpdate({
       target: matches.apiId,
       set: {
-        status: statusMap[fixture.status.short] || "scheduled",
-        homeGoals: goals.home,
-        awayGoals: goals.away,
-        homeXg: homeStats["Expected Goals"] ? String(homeStats["Expected Goals"]) : null,
-        awayXg: awayStats["Expected Goals"] ? String(awayStats["Expected Goals"]) : null,
-        homeYellows: homeStats["Yellow Cards"] || 0,
-        awayYellows: awayStats["Yellow Cards"] || 0,
-        homeReds: homeStats["Red Cards"] || 0,
-        awayReds: awayStats["Red Cards"] || 0,
-        homeCorners: homeStats["Corner Kicks"] || 0,
-        awayCorners: awayStats["Corner Kicks"] || 0,
-        homePossession: homeStats["Ball Possession"] ? String(homeStats["Ball Possession"]) : null,
-        awayPossession: awayStats["Ball Possession"] ? String(awayStats["Ball Possession"]) : null,
-        homeShots: homeStats["Total Shots"] || null,
-        awayShots: awayStats["Total Shots"] || null,
-        homeShotsOnTarget: homeStats["Shots on Goal"] || null,
-        awayShotsOnTarget: awayStats["Shots on Goal"] || null,
+        status: statusMap[match.status] || "scheduled",
+        homeGoals: match.score?.home ?? null,
+        awayGoals: match.score?.away ?? null,
+        homeXg: homeStats.xg != null ? String(homeStats.xg) : null,
+        awayXg: awayStats.xg != null ? String(awayStats.xg) : null,
+        homeYellows: homeStats.yellow_cards || 0,
+        awayYellows: awayStats.yellow_cards || 0,
+        homeReds: homeStats.red_cards || 0,
+        awayReds: awayStats.red_cards || 0,
+        homeCorners: homeStats.corners || 0,
+        awayCorners: awayStats.corners || 0,
+        homePossession: homeStats.possession != null ? String(homeStats.possession) : null,
+        awayPossession: awayStats.possession != null ? String(awayStats.possession) : null,
+        homeShots: homeStats.shots || null,
+        awayShots: awayStats.shots || null,
+        homeShotsOnTarget: homeStats.shots_on_target || null,
+        awayShotsOnTarget: awayStats.shots_on_target || null,
         updatedAt: new Date(),
       },
     });
     count++;
   }
 
+  console.log(`[Matches] Upserted ${count}, skipped ${skipped} for league ${leagueKey}`);
   return count;
 }
 
+// ─── Compute form ─────────────────────────────────────────────
 export async function computeForm(): Promise<number> {
   const finishedMatches = await db.execute(sql`
     SELECT m.* FROM matches m
@@ -248,19 +289,17 @@ export async function computeForm(): Promise<number> {
     ORDER BY m.match_date ASC
   `);
 
+  const rows = finishedMatches.rows as any[];
+  console.log(`[Form] ${rows.length} finished matches need form entries`);
+
   let count = 0;
-
-  for (const match of finishedMatches.rows as any[]) {
-    const matchId = match.id;
-    const homeTeamId = match.home_team_id;
-    const awayTeamId = match.away_team_id;
-    const matchDate = new Date(match.match_date);
-
-    await computeTeamFormEntry(homeTeamId, matchId, matchDate, "home", match);
-    await computeTeamFormEntry(awayTeamId, matchId, matchDate, "away", match);
+  for (const match of rows) {
+    await computeTeamFormEntry(match.home_team_id, match.id, new Date(match.match_date), "home", match);
+    await computeTeamFormEntry(match.away_team_id, match.id, new Date(match.match_date), "away", match);
     count += 2;
   }
 
+  console.log(`[Form] Computed ${count} form entries`);
   return count;
 }
 
@@ -358,39 +397,83 @@ async function computeTeamFormEntry(
   } as any]);
 }
 
+// ─── Main pipeline ──────────────────────────────────────────────
 export async function runIngestionPipeline(): Promise<{
   leagues: number;
   teams: number;
   matches: number;
   formEntries: number;
+  errors: string[];
+  apiCalls: number;
 }> {
+  const errors: string[] = [];
+  let apiCalls = 0;
   const results = {
     leagues: 0,
     teams: 0,
     matches: 0,
     formEntries: 0,
+    errors,
+    apiCalls,
   };
 
-  results.leagues = await ingestLeagues();
+  console.log("[Pipeline] ===== Starting BigBallsData ingestion =====");
+  console.log(`[Pipeline] API_KEY present: ${!!API_KEY}`);
 
-  const activeLeagues = [39, 140, 135, 78, 61];
-  const season = "2025";
+  // Step 1: Leagues (0 API calls — hardcoded)
+  try {
+    results.leagues = await ingestLeagues();
+    console.log(`[Pipeline] Leagues: ${results.leagues}`);
+  } catch (error) {
+    const msg = `Leagues failed: ${error}`;
+    console.error(`[Pipeline] ${msg}`);
+    errors.push(msg);
+  }
 
-  for (const leagueId of activeLeagues) {
+  // Step 2 & 3: Teams + Matches per league
+  for (const config of LEAGUE_CONFIG) {
     try {
-      results.teams += await ingestTeams(String(leagueId), season);
+      console.log(`[Pipeline] --- League ${config.key} ---`);
 
-      const today = new Date();
-      const from = new Date(today.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
-      const to = new Date(today.getTime() + 14 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+      // Teams extracted from matches (1 call)
+      const teamsCount = await ingestTeams(config.key);
+      results.teams += teamsCount;
+      apiCalls += 1;
+      console.log(`[Pipeline] ${config.key}: ${teamsCount} teams`);
 
-      results.matches += await ingestMatches(String(leagueId), season, from, to);
+      if (teamsCount === 0) {
+        console.warn(`[Pipeline] ${config.key}: 0 teams, skipping matches`);
+        continue;
+      }
+
+      // Matches (1 call) + stats per match (N calls)
+      const matchesCount = await ingestMatches(config.key);
+      results.matches += matchesCount;
+      apiCalls += 1; // matches list
+      apiCalls += matchesCount; // stats per match
+      console.log(`[Pipeline] ${config.key}: ${matchesCount} matches`);
     } catch (error) {
-      console.error(`Failed to ingest league ${leagueId}:`, error);
+      const msg = `League ${config.key}: ${error}`;
+      console.error(`[Pipeline] ${msg}`);
+      errors.push(msg);
     }
   }
 
-  results.formEntries = await computeForm();
+  // Step 4: Form (0 API calls)
+  try {
+    results.formEntries = await computeForm();
+    console.log(`[Pipeline] Form entries: ${results.formEntries}`);
+  } catch (error) {
+    const msg = `Form failed: ${error}`;
+    console.error(`[Pipeline] ${msg}`);
+    errors.push(msg);
+  }
+
+  results.apiCalls = apiCalls;
+
+  console.log("[Pipeline] ===== Complete =====");
+  console.log(`[Pipeline] API calls used: ${apiCalls}/1000`);
+  console.log(`[Pipeline] Results:`, results);
 
   return results;
 }
