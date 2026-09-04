@@ -1,10 +1,11 @@
 /**
  * Prediction engine with fallback for missing form data
- * When no historical form exists, uses league averages as baseline
+ * When no historical form exists, uses team season xG (Understat) if
+ * available, falling back further to league averages as a last resort.
  */
 
 import { db } from "@/lib/db";
-import { matches, teamForm, predictions } from "@/lib/db/schema";
+import { matches, teamForm, teamSeasonXg, predictions } from "@/lib/db/schema";
 import { eq, and, desc, gte, sql } from "drizzle-orm";
 import {
   generateScoreMatrix,
@@ -61,6 +62,21 @@ async function getTeamForm(teamId: number, venue: "home" | "away", limit: number
     .limit(limit);
 }
 
+async function getTeamSeasonXg(teamId: number): Promise<{ xgPerGame: number; xgaPerGame: number } | null> {
+  const [row] = await db
+    .select()
+    .from(teamSeasonXg)
+    .where(eq(teamSeasonXg.teamId, teamId))
+    .orderBy(desc(teamSeasonXg.season))
+    .limit(1);
+
+  if (!row) return null;
+  return {
+    xgPerGame: Number(row.xgPerGame),
+    xgaPerGame: Number(row.xgaPerGame),
+  };
+}
+
 async function getLeagueAverages(leagueId: number | null): Promise<LeagueAverages> {
   if (!leagueId) {
     return {
@@ -100,8 +116,30 @@ async function getLeagueAverages(leagueId: number | null): Promise<LeagueAverage
 }
 
 // ─── Fallback form data generator ─────────────────────────────
-function createFallbackForm(leagueAverages: LeagueAverages, venue: "home" | "away") {
+// Prefers team-specific Understat season xG when available; falls back
+// to flat league averages only when neither match-level form nor
+// season xG exists for a team.
+function createFallbackForm(
+  leagueAverages: LeagueAverages,
+  venue: "home" | "away",
+  seasonXg: { xgPerGame: number; xgaPerGame: number } | null
+) {
   const isHome = venue === "home";
+
+  if (seasonXg) {
+    return {
+      xgFor: seasonXg.xgPerGame,
+      xgAgainst: seasonXg.xgaPerGame,
+      goalsScored: seasonXg.xgPerGame,
+      goalsConceded: seasonXg.xgaPerGame,
+      cornersFor: leagueAverages.avgTotalCorners / 2,
+      cornersAgainst: leagueAverages.avgTotalCorners / 2,
+      possession: 50,
+      shots: isHome ? 12 : 10,
+      yellows: leagueAverages.avgTotalYellows / 2,
+    };
+  }
+
   return {
     xgFor: isHome ? leagueAverages.avgHomeXg : leagueAverages.avgAwayXg,
     xgAgainst: isHome ? leagueAverages.avgAwayXg : leagueAverages.avgHomeXg,
@@ -131,8 +169,13 @@ export async function computeMatchPrediction(
   const hasHomeForm = homeFormData.length >= 3;
   const hasAwayForm = awayFormData.length >= 3;
 
-  const homeFallback = createFallbackForm(leagueAverages, "home");
-  const awayFallback = createFallbackForm(leagueAverages, "away");
+  const [homeSeasonXg, awaySeasonXg] = await Promise.all([
+    hasHomeForm ? Promise.resolve(null) : getTeamSeasonXg(homeTeamId),
+    hasAwayForm ? Promise.resolve(null) : getTeamSeasonXg(awayTeamId),
+  ]);
+
+  const homeFallback = createFallbackForm(leagueAverages, "home", homeSeasonXg);
+  const awayFallback = createFallbackForm(leagueAverages, "away", awaySeasonXg);
 
   const home5 = hasHomeForm ? homeFormData.slice(0, 5) : [homeFallback, homeFallback, homeFallback];
   const away5 = hasAwayForm ? awayFormData.slice(0, 5) : [awayFallback, awayFallback, awayFallback];
@@ -208,10 +251,14 @@ export async function computeMatchPrediction(
     awayFormData.length
   );
 
-  // Lower confidence when using fallback data
-  const adjustedConfidence = (hasHomeForm && hasAwayForm) 
-    ? confidence 
-    : Math.min(confidence, 0.45); // Cap at 45% when using averages
+  // Lower confidence when using fallback data. Season-xG-backed fallback
+  // carries more real signal than a flat league average, so it gets a
+  // slightly higher cap.
+  const usingSeasonXgFallback = (!hasHomeForm && !!homeSeasonXg) || (!hasAwayForm && !!awaySeasonXg);
+  const fallbackCap = usingSeasonXgFallback ? 0.55 : 0.45;
+  const adjustedConfidence = (hasHomeForm && hasAwayForm)
+    ? confidence
+    : Math.min(confidence, fallbackCap);
 
   const scoreProbs: Record<string, number> = {};
   topScores.forEach(({ score, probability }) => {
@@ -245,6 +292,7 @@ export async function computeMatchPrediction(
       homeFormGames: homeFormData.length,
       awayFormGames: awayFormData.length,
       usingFallback: !hasHomeForm || !hasAwayForm,
+      usingSeasonXgFallback,
       homeAttackStrength: Math.round(homeAttackStrength * 100) / 100,
       awayAttackStrength: Math.round(awayAttackStrength * 100) / 100,
       leagueAvgHomeXg: leagueAverages.avgHomeXg,
