@@ -6,6 +6,7 @@
 import { db } from "@/lib/db";
 import { matches, teams, leagues, teamForm } from "@/lib/db/schema";
 import { eq, and, sql } from "drizzle-orm";
+import { backfillHistoricalXg } from "../ingest/understat";
 
 const API_BASE = "https://api.bigballsdata.com";
 const API_KEY = process.env.BIGBALLSDATA_API_KEY;
