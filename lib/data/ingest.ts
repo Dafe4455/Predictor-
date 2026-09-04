@@ -6,7 +6,7 @@
 import { db } from "@/lib/db";
 import { matches, teams, leagues, teamForm } from "@/lib/db/schema";
 import { eq, and, sql } from "drizzle-orm";
-import { backfillHistoricalXg } from "../ingest/understat";
+import { backfillTeamSeasonXg } from "../ingest/understat";
 
 const API_BASE = "https://api.bigballsdata.com";
 const API_KEY = process.env.BIGBALLSDATA_API_KEY;
@@ -492,10 +492,10 @@ export async function runIngestionPipeline(): Promise<{
   }
 
   try {
-    await backfillHistoricalXg(["2023", "2024", "2025"]);
-    console.log("[Pipeline] Historical xG backfilled");
+    await backfillTeamSeasonXg(["2023", "2024", "2025"]);
+    console.log("[Pipeline] Team season xG backfilled");
   } catch (error) {
-    const msg = `Historical xG backfill failed: ${error}`;
+    const msg = `Team season xG backfill failed: ${error}`;
     console.error(`[Pipeline] ${msg}`);
     errors.push(msg);
   }
