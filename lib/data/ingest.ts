@@ -492,6 +492,15 @@ export async function runIngestionPipeline(): Promise<{
   }
 
   try {
+    await backfillHistoricalXg(["2023", "2024", "2025"]);
+    console.log("[Pipeline] Historical xG backfilled");
+  } catch (error) {
+    const msg = `Historical xG backfill failed: ${error}`;
+    console.error(`[Pipeline] ${msg}`);
+    errors.push(msg);
+  }
+
+  try {
     results.formEntries = await computeForm();
     console.log(`[Pipeline] Form entries: ${results.formEntries}`);
   } catch (error) {
