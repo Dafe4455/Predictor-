@@ -9,6 +9,7 @@ import {
   text,
   boolean,
   index,
+  unique,
 } from "drizzle-orm/pg-core";
 import { relations } from "drizzle-orm";
 
@@ -54,6 +55,7 @@ export const teamsRelations = relations(teams, ({ one, many }) => ({
   homeMatches: many(matches, { relationName: "homeTeam" }),
   awayMatches: many(matches, { relationName: "awayTeam" }),
   formEntries: many(teamForm),
+  seasonXg: many(teamSeasonXg),
 }));
 
 // Matches
@@ -154,6 +156,26 @@ export const teamFormRelations = relations(teamForm, ({ one }) => ({
   match: one(matches, { fields: [teamForm.matchId], references: [matches.id] }),
 }));
 
+// Team Season xG (Understat season aggregates — fallback signal when
+// match-level form data is insufficient)
+export const teamSeasonXg = pgTable("team_season_xg", {
+  id: serial("id").primaryKey(),
+  teamId: integer("team_id").notNull().references(() => teams.id),
+  season: varchar("season", { length: 10 }).notNull(),
+  xgPerGame: decimal("xg_per_game", { precision: 4, scale: 2 }).notNull(),
+  xgaPerGame: decimal("xga_per_game", { precision: 4, scale: 2 }).notNull(),
+  matchesPlayed: integer("matches_played").notNull(),
+  source: varchar("source", { length: 20 }).notNull().default("understat"),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
+}, (table) => [
+  index("team_season_xg_team_idx").on(table.teamId),
+  unique("team_season_xg_team_season_unique").on(table.teamId, table.season),
+]);
+
+export const teamSeasonXgRelations = relations(teamSeasonXg, ({ one }) => ({
+  team: one(teams, { fields: [teamSeasonXg.teamId], references: [teams.id] }),
+}));
+
 // Predictions
 export const predictions = pgTable("predictions", {
   id: serial("id").primaryKey(),
@@ -215,6 +237,7 @@ export type League = typeof leagues.$inferSelect;
 export type Team = typeof teams.$inferSelect;
 export type Match = typeof matches.$inferSelect;
 export type TeamForm = typeof teamForm.$inferSelect;
+export type TeamSeasonXg = typeof teamSeasonXg.$inferSelect;
 export type Prediction = typeof predictions.$inferSelect;
 export type PredictionAccuracy = typeof predictionAccuracy.$inferSelect;
 
@@ -222,4 +245,5 @@ export type NewLeague = typeof leagues.$inferInsert;
 export type NewTeam = typeof teams.$inferInsert;
 export type NewMatch = typeof matches.$inferInsert;
 export type NewTeamForm = typeof teamForm.$inferInsert;
+export type NewTeamSeasonXg = typeof teamSeasonXg.$inferInsert;
 export type NewPrediction = typeof predictions.$inferInsert;
